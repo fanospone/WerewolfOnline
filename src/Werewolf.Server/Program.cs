@@ -1,0 +1,12 @@
+using Werewolf.Server.Hubs;
+using Werewolf.Server.Services;
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSignalR();
+builder.Services.AddSingleton<GameHistoryStore>();
+builder.Services.AddSingleton<RoomManager>();
+var app = builder.Build();
+app.UseDefaultFiles(); app.UseStaticFiles();
+app.MapGet("/health", () => Results.Ok(new { status = "ok", app = "WerewolfOnline" }));
+app.MapHub<GameHub>("/gameHub"); app.MapFallbackToFile("index.html");
+await app.Services.GetRequiredService<GameHistoryStore>().InitializeAsync();
+app.Run();
