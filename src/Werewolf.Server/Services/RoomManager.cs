@@ -1,31 +1,226 @@
-using System.Collections.Concurrent;
 using Microsoft.AspNetCore.SignalR;
+using System.Collections.Concurrent;
 using Werewolf.Server.Engine;
 using Werewolf.Server.Hubs;
 using Werewolf.Server.Models;
 namespace Werewolf.Server.Services;
-public sealed class RoomManager(IHubContext<GameHub> hub,GameHistoryStore history) {
- const int Max=10; readonly ConcurrentDictionary<string,GameRoom> rooms=new();
- public GameRoom Create(string conn,string name){var p=NewPlayer(conn,name);var code=NewCode();var r=new GameRoom{Code=code,HostPlayerId=p.Id};r.Players.Add(p);rooms[code]=r;return r;}
- public GameRoom Join(string code,string conn,string name){var r=Get(code);lock(r.SyncRoot){if(r.Phase!=GamePhase.Lobby)throw new InvalidOperationException("Game sudah dimulai.");if(r.Players.Count>=Max)throw new InvalidOperationException("Room penuh.");if(r.Players.Any(p=>p.Name.Equals(name.Trim(),StringComparison.OrdinalIgnoreCase)))throw new InvalidOperationException("Nama sudah digunakan.");r.Players.Add(NewPlayer(conn,name));}return r;}
- public GameRoom Start(string code,string playerId){var r=Get(code);lock(r.SyncRoot){if(r.HostPlayerId!=playerId)throw new InvalidOperationException("Hanya host yang bisa memulai.");if(r.Players.Count<6)throw new InvalidOperationException("Minimal 6 pemain.");if(r.Phase!=GamePhase.Lobby)throw new InvalidOperationException("Game sudah dimulai.");GameEngine.AssignRoles(r);r.Round=1;SetPhase(r,GamePhase.Night,25);}return r;}
- public (GameRoom Room,Player Player) FindByConnection(string conn){var r=rooms.Values.FirstOrDefault(x=>x.Players.Any(p=>p.ConnectionId==conn))??throw new InvalidOperationException("Belum bergabung ke room.");return(r,r.Players.First(p=>p.ConnectionId==conn));}
- public void NightAction(string code,string pid,string tid){var r=Get(code);lock(r.SyncRoot){if(r.Phase!=GamePhase.Night)throw new InvalidOperationException("Bukan fase malam.");var p=Alive(r,pid);var t=Alive(r,tid);if(pid==tid)throw new InvalidOperationException("Tidak bisa memilih diri sendiri.");if(p.Role==RoleType.Werewolf&&t.Role==RoleType.Werewolf)throw new InvalidOperationException("Tidak bisa menyerang sesama Werewolf.");if(p.Role is not(RoleType.Werewolf or RoleType.Seer or RoleType.Doctor))throw new InvalidOperationException("Role tidak memiliki aksi malam.");r.NightActions[pid]=tid;}}
- public void Vote(string code,string pid,string tid){var r=Get(code);lock(r.SyncRoot){if(r.Phase!=GamePhase.Voting)throw new InvalidOperationException("Bukan fase voting.");Alive(r,pid);Alive(r,tid);if(pid==tid)throw new InvalidOperationException("Tidak bisa memilih diri sendiri.");r.Votes[pid]=tid;}}
- public RoomSnapshot Snapshot(string code,string? viewer=null){var r=Get(code);lock(r.SyncRoot)return new(r.Code,r.Phase.ToString(),r.Round,r.Players.Count,Max,r.PhaseEndsAt,r.Winner,r.Players.Select(p=>new PublicPlayer(p.Id,p.Name,p.IsAlive,p.Id==viewer)).ToArray());}
- public async Task Broadcast(GameRoom r){foreach(var p in r.Players)await hub.Clients.Client(p.ConnectionId).SendAsync("RoomUpdated",Snapshot(r.Code,p.Id));}
- public async Task Chat(string code,string pid,string message){var r=Get(code);var p=Alive(r,pid);if(r.Phase!=GamePhase.Discussion)throw new InvalidOperationException("Chat hanya saat diskusi.");message=message.Trim();if(message.Length is <1 or >300)throw new InvalidOperationException("Pesan 1-300 karakter.");await hub.Clients.Group(code).SendAsync("ChatReceived",new ChatMessage(p.Name,message,DateTimeOffset.UtcNow));}
- public async Task RunClock(string code){while(rooms.TryGetValue(code,out var r)){GamePhase phase;DateTimeOffset end;lock(r.SyncRoot){phase=r.Phase;end=r.PhaseEndsAt;if(phase is GamePhase.Finished or GamePhase.Lobby)return;}var delay=end-DateTimeOffset.UtcNow;if(delay>TimeSpan.Zero)await Task.Delay(delay);if(!rooms.TryGetValue(code,out r))return;
-  (string? killed,string? seer,string? inspected,string? result) night=default;string? eliminated=null,winner=null;
-  lock(r.SyncRoot){if(r.Phase!=phase||r.Phase is GamePhase.Finished or GamePhase.Lobby)continue;if(phase==GamePhase.Night){night=GameEngine.ResolveNight(r);winner=GameEngine.GetWinner(r);if(winner==null)SetPhase(r,GamePhase.Discussion,35);}else if(phase==GamePhase.Discussion)SetPhase(r,GamePhase.Voting,20);else if(phase==GamePhase.Voting){eliminated=GameEngine.ResolveVoting(r);winner=GameEngine.GetWinner(r);if(winner==null){r.Round++;SetPhase(r,GamePhase.Night,25);}}if(winner!=null){r.Winner=winner;r.Phase=GamePhase.Finished;r.PhaseEndsAt=DateTimeOffset.UtcNow;}}
-  if(night.seer!=null&&night.inspected!=null){var seerPlayer=r.Players.FirstOrDefault(p=>p.Id==night.seer);var target=r.Players.FirstOrDefault(p=>p.Id==night.inspected);if(seerPlayer!=null&&target!=null)await hub.Clients.Client(seerPlayer.ConnectionId).SendAsync("PrivateNotice",$"Hasil pemeriksaan: {target.Name} {(night.result=="Werewolf"?"adalah Werewolf":"bukan Werewolf")}");}
-  if(night.killed!=null){var victim=r.Players.FirstOrDefault(p=>p.Id==night.killed);await hub.Clients.Group(code).SendAsync("GameNotice",$"{victim?.Name} ditemukan tewas pagi ini.");}
-  if(eliminated!=null){var victim=r.Players.FirstOrDefault(p=>p.Id==eliminated);await hub.Clients.Group(code).SendAsync("GameNotice",$"{victim?.Name} tereliminasi melalui voting.");}
-  if(winner!=null){await history.SaveResultAsync(code,winner,r.Players.Count);await hub.Clients.Group(code).SendAsync("GameNotice",$"{winner} menang!");}await Broadcast(r);
- }}
- GameRoom Get(string code)=>rooms.TryGetValue(code.Trim().ToUpperInvariant(),out var r)?r:throw new InvalidOperationException("Room tidak ditemukan.");
- static Player Alive(GameRoom r,string id)=>r.Players.FirstOrDefault(p=>p.Id==id&&p.IsAlive)??throw new InvalidOperationException("Pemain tidak ditemukan atau sudah mati.");
- static Player NewPlayer(string conn,string name){name=name.Trim();if(name.Length is <2 or >20)throw new InvalidOperationException("Nama harus 2-20 karakter.");return new Player{Id=Guid.NewGuid().ToString("N"),ConnectionId=conn,Name=name};}
- static string NewCode(){const string chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";return new string(Enumerable.Range(0,5).Select(_=>chars[Random.Shared.Next(chars.Length)]).ToArray());}
- static void SetPhase(GameRoom r,GamePhase p,int seconds){r.Phase=p;r.PhaseEndsAt=DateTimeOffset.UtcNow.AddSeconds(seconds);if(p==GamePhase.Night)r.NightActions.Clear();if(p==GamePhase.Voting)r.Votes.Clear();}
+public sealed class RoomManager(IHubContext<GameHub> hub, GameHistoryStore history)
+{
+    const int Max = 10;
+    readonly ConcurrentDictionary<string, GameRoom> rooms = new();
+    public GameRoom Create(string conn, string name)
+    {
+        var p = NewPlayer(conn, name);
+        var code = NewCode();
+        var r = new GameRoom
+        {
+            Code = code,
+            HostPlayerId = p.Id
+        };
+        r.Players.Add(p);
+        rooms[code] = r;
+        return r;
+    }
+    public GameRoom Join(string code, string conn, string name)
+    {
+        var r = Get(code); lock (r.SyncRoot)
+        {
+            if (r.Phase != GamePhase.Lobby)
+                throw new InvalidOperationException("Game sudah dimulai.");
+            if (r.Players.Count >= Max)
+                throw new InvalidOperationException("Room penuh.");
+            if (r.Players.Any(p => p.Name.Equals(name.Trim(), StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException("Nama sudah digunakan.");
+            r.Players.Add(NewPlayer(conn, name));
+        }
+        return r;
+    }
+    public GameRoom Start(string code, string playerId)
+    {
+        var room = Get(code);
+
+        lock (room.SyncRoot)
+        {
+            if (room.HostPlayerId != playerId)
+                throw new InvalidOperationException(
+                    "Hanya Host yang dapat memulai permainan.");
+
+            int totalPlayers = room.Players.Count;
+
+            if (totalPlayers < 6)
+                throw new InvalidOperationException(
+                    $"Minimal 6 pemain. Saat ini baru {totalPlayers} pemain.");
+
+            if (totalPlayers > 10)
+                throw new InvalidOperationException(
+                    "Maksimal 10 pemain.");
+
+            if (room.Phase != GamePhase.Lobby)
+                throw new InvalidOperationException(
+                    "Permainan sudah dimulai.");
+
+            GameEngine.AssignRoles(room);
+
+            room.Round = 1;
+            room.Phase = GamePhase.Night;
+            room.PhaseEndsAt = DateTimeOffset.UtcNow.AddSeconds(25);
+
+            return room;
+        }
+    }
+    public (GameRoom Room, Player Player) FindByConnection(string conn)
+    {
+        var r = rooms.Values.FirstOrDefault(x => x.Players.Any(p => p.ConnectionId == conn)) ?? throw new InvalidOperationException("Belum bergabung ke room.");
+        return (r, r.Players.First(p => p.ConnectionId == conn));
+    }
+    public void NightAction(string code, string pid, string tid)
+    {
+        var r = Get(code); lock (r.SyncRoot)
+        {
+            if (r.Phase != GamePhase.Night)
+                throw new InvalidOperationException("Bukan fase malam.");
+            var p = Alive(r, pid);
+            var t = Alive(r, tid);
+            if (pid == tid)
+                throw new InvalidOperationException("Tidak bisa memilih diri sendiri.");
+            if (p.Role == RoleType.Werewolf && t.Role == RoleType.Werewolf)
+                throw new InvalidOperationException("Tidak bisa menyerang sesama Werewolf.");
+            if (p.Role is not (RoleType.Werewolf or RoleType.Seer or RoleType.Doctor))
+                throw new InvalidOperationException("Role tidak memiliki aksi malam.");
+            r.NightActions[pid] = tid;
+        }
+    }
+    public void Vote(string code, string pid, string tid)
+    {
+        var r = Get(code);
+        lock (r.SyncRoot)
+        {
+            if (r.Phase != GamePhase.Voting)
+                throw new InvalidOperationException("Bukan fase voting.");
+            Alive(r, pid); Alive(r, tid);
+            if (pid == tid)
+                throw new InvalidOperationException("Tidak bisa memilih diri sendiri.");
+            r.Votes[pid] = tid;
+        }
+    }
+    public RoomSnapshot Snapshot(string code, string? viewer = null)
+    {
+        var r = Get(code); lock (r.SyncRoot)
+            return new(
+                r.Code,
+                r.Phase.ToString(),
+                r.Round,
+                r.Players.Count,
+                Max,
+                r.PhaseEndsAt,
+                r.Winner,
+                r.Players.Select(p => new PublicPlayer(p.Id, p.Name, p.IsAlive, p.Id == viewer)).ToArray());
+    }
+    public async Task Broadcast(GameRoom r)
+    {
+        foreach (var p in r.Players)
+            await hub.Clients.Client(p.ConnectionId).SendAsync("RoomUpdated", Snapshot(r.Code, p.Id));
+    }
+    public async Task Chat(string code, string pid, string message)
+    {
+        var r = Get(code);
+        var p = Alive(r, pid);
+        if (r.Phase != GamePhase.Discussion)
+            throw new InvalidOperationException("Chat hanya saat diskusi.");
+        message = message.Trim();
+        if (message.Length is < 1 or > 300)
+            throw new InvalidOperationException("Pesan 1-300 karakter.");
+        await hub.Clients.Group(code).SendAsync("ChatReceived", new ChatMessage(p.Name, message, DateTimeOffset.UtcNow));
+    }
+    public async Task RunClock(string code)
+    {
+        while (rooms.TryGetValue(code, out var r))
+        {
+            GamePhase phase;
+            DateTimeOffset end;
+            lock (r.SyncRoot)
+            {
+                phase = r.Phase; end = r.PhaseEndsAt; if (phase is GamePhase.Finished or GamePhase.Lobby) return;
+            }
+            var delay = end - DateTimeOffset.UtcNow;
+            if (delay > TimeSpan.Zero)
+                await Task.Delay(delay);
+            if (!rooms.TryGetValue(code, out r))
+                return;
+            (string? killed, string? seer, string? inspected, string? result)
+                night = default;
+            string? eliminated = null, winner = null;
+            lock (r.SyncRoot)
+            {
+                if (r.Phase != phase || r.Phase is GamePhase.Finished or GamePhase.Lobby) continue;
+                if (phase == GamePhase.Night)
+                {
+                    night = GameEngine.ResolveNight(r);
+                    winner = GameEngine.GetWinner(r);
+                    if (winner == null) SetPhase(r, GamePhase.Discussion, 35);
+                }
+                else if (phase == GamePhase.Discussion)
+                    SetPhase(r, GamePhase.Voting, 20);
+                else if (phase == GamePhase.Voting)
+                {
+                    eliminated = GameEngine.ResolveVoting(r);
+                    winner = GameEngine.GetWinner(r);
+                    if (winner == null)
+                    {
+                        r.Round++;
+                        SetPhase(r, GamePhase.Night, 25);
+                    }
+                }
+                if (winner != null) { r.Winner = winner; r.Phase = GamePhase.Finished; r.PhaseEndsAt = DateTimeOffset.UtcNow; }
+            }
+            if (night.seer != null && night.inspected != null)
+            {
+                var seerPlayer = r.Players.FirstOrDefault(p => p.Id == night.seer);
+                var target = r.Players.FirstOrDefault(p => p.Id == night.inspected);
+                if (seerPlayer != null && target != null)
+                    await hub.Clients.Client(seerPlayer.ConnectionId).SendAsync("PrivateNotice", $"Hasil pemeriksaan: {target.Name} {(night.result == "Werewolf" ? "adalah Werewolf" : "bukan Werewolf")}");
+            }
+            if (night.killed != null)
+            {
+                var victim = r.Players.FirstOrDefault(p => p.Id == night.killed);
+                await hub.Clients.Group(code).SendAsync("GameNotice", $"{victim?.Name} ditemukan tewas pagi ini.");
+            }
+            if (eliminated != null)
+            {
+                var victim = r.Players.FirstOrDefault(p => p.Id == eliminated);
+                await hub.Clients.Group(code).SendAsync("GameNotice", $"{victim?.Name} tereliminasi melalui voting.");
+            }
+            if (winner != null)
+            {
+                await history.SaveResultAsync(code, winner, r.Players.Count);
+                await hub.Clients.Group(code).SendAsync("GameNotice", $"{winner} menang!");
+            }
+            await Broadcast(r);
+        }
+    }
+    GameRoom Get(string code) => rooms.TryGetValue(code.Trim().ToUpperInvariant(), out var r) ? r : throw new InvalidOperationException("Room tidak ditemukan.");
+    static Player Alive(GameRoom r, string id) => r.Players.FirstOrDefault(p => p.Id == id && p.IsAlive) ?? throw new InvalidOperationException("Pemain tidak ditemukan atau sudah mati.");
+    static Player NewPlayer(string conn, string name)
+    {
+        name = name.Trim();
+        if (name.Length is < 2 or > 20)
+            throw new InvalidOperationException("Nama harus 2-20 karakter.");
+        return new Player
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            ConnectionId = conn,
+            Name = name
+        };
+    }
+    static string NewCode()
+    {
+        const string chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        return new string(Enumerable.Range(0, 5).Select(_ => chars[Random.Shared.Next(chars.Length)]).ToArray());
+    }
+    static void SetPhase(GameRoom r, GamePhase p, int seconds)
+    {
+        r.Phase = p; r.PhaseEndsAt = DateTimeOffset.UtcNow.AddSeconds(seconds);
+        if (p == GamePhase.Night) r.NightActions.Clear();
+        if (p == GamePhase.Voting) r.Votes.Clear();
+    }
 }
