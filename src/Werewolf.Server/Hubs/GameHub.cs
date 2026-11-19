@@ -1,4 +1,3 @@
-
 using Microsoft.AspNetCore.SignalR;
 using Werewolf.Server.Services;
 
@@ -10,8 +9,7 @@ public sealed class GameHub(RoomManager rooms) : Hub
     {
         var r = rooms.Create(Context.ConnectionId, playerName);
 
-        await Groups.AddToGroupAsync(
-            Context.ConnectionId, r.Code);
+        await Groups.AddToGroupAsync(Context.ConnectionId, r.Code);
 
         await Clients.Caller.SendAsync("JoinedRoom", new
         {
@@ -21,19 +19,15 @@ public sealed class GameHub(RoomManager rooms) : Hub
         });
 
         await rooms.Broadcast(r);
-
         return r.Code;
     }
 
     public async Task JoinRoom(string code, string playerName)
     {
-        var r = rooms.Join(
-            code, Context.ConnectionId, playerName);
-
+        var r = rooms.Join(code, Context.ConnectionId, playerName);
         var p = r.Players.Last();
 
-        await Groups.AddToGroupAsync(
-            Context.ConnectionId, r.Code);
+        await Groups.AddToGroupAsync(Context.ConnectionId, r.Code);
 
         await Clients.Caller.SendAsync("JoinedRoom", new
         {
@@ -44,7 +38,6 @@ public sealed class GameHub(RoomManager rooms) : Hub
 
         await rooms.Broadcast(r);
     }
-
 
     public async Task StartGame(string code, string playerId)
     {
@@ -59,47 +52,41 @@ public sealed class GameHub(RoomManager rooms) : Hub
             {
                 var pack = string.Join(", ",
                     r.Players
-                        .Where(x => x.Role == Werewolf.Server.Models.RoleType.Werewolf
-                                 && x.Id != p.Id)
+                        .Where(x => x.Role == Werewolf.Server.Models.RoleType.Werewolf && x.Id != p.Id)
                         .Select(x => x.Name));
 
                 await Clients.Client(p.ConnectionId).SendAsync(
                     "PrivateNotice",
-                    string.IsNullOrEmpty(pack)
-                        ? "Kamu Werewolf tunggal."
-                        : $"Rekan Werewolf: {pack}"
+                    string.IsNullOrEmpty(pack) ? "Kamu Werewolf tunggal." : $"Rekan Werewolf: {pack}"
                 );
             }
         }
 
-        await Clients.Group(code).SendAsync(
-            "GameNotice",
-            "Permainan dimulai. Malam pertama tiba."
-        );
-
+        await Clients.Group(code).SendAsync("GameNotice", "Permainan dimulai. Malam pertama tiba.");
         await rooms.Broadcast(r);
-
-        // Jalankan moderator otomatis
         _ = rooms.RunClock(code);
     }
 
-    public Task NightAction(
-        string code, string playerId, string targetId)
+    public Task NightAction(string code, string playerId, string targetId)
     {
         rooms.NightAction(code, playerId, targetId);
         return Task.CompletedTask;
     }
 
-    public Task Vote(
-        string code, string playerId, string targetId)
+    public Task Vote(string code, string playerId, string targetId)
     {
         rooms.Vote(code, playerId, targetId);
         return Task.CompletedTask;
     }
 
-    public Task SendChat(
-        string code, string playerId, string message)
+    public Task SendChat(string code, string playerId, string message)
     {
         return rooms.Chat(code, playerId, message);
+    }
+
+    // Identitas pengirim ditentukan dari koneksi SignalR, bukan playerId dari browser.
+    public Task SendWerewolfMessage(string roomCode, string message)
+    {
+        return rooms.ChatWerewolf(roomCode, Context.ConnectionId, message);
     }
 }
